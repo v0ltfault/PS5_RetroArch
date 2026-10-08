@@ -1,0 +1,340 @@
+#!/usr/bin/env bash
+# PS5 RetroArch - build the title.
+#
+#   tools/build-title.sh            compile the frontend, then link and sign it
+#   tools/build-title.sh --stage    also copy the result to handoff/<TITLE_ID>/
+#
+# The whole build is three steps that depend on each other in one direction:
+#
+#   1. tools/build-retroarch.sh   compiles RetroArch's own sources into
+#                                 build/ra/libretroarch.a
+#   2. make app                   compiles src/, links that archive with the
+#                                 pipeline's CRT, signs the result and assembles
+#                                 the title folder under dist/<TITLE_ID>/
+#   3. handoff                    a copy of that folder for the console's owner
+#
+# Step 2 is the project's own Makefile, not a reimplementation of it. What this
+# script adds is the four things the Makefile cannot know, each of which was found
+# by a failed build and is why the environment is set here rather than typed:
+#
+#   PS5_PAYLOAD_SDK   this project's vendored SDK, not the one in $HOME and not a
+#                     sibling's: the wrapper's default and the donor's differ
+#   PS5_CLANG         the toolchain's wrapper defaults to clang-18, which is not
+#                     installed; plain clang is what this machine builds with
+#   PYTHONPATH        mbedTLS regenerates a source file by running a script that
+#                     imports jsonschema; tooling/pystub supplies it
+#   APP_INCLUDE_PATHS src/ includes RetroArch's headers, and those come from the
+#                     configured copy under build/ so the driver is declared
+#   APP_STATIC_ARCHIVES the frontend archive from step 1
+#
+# Signing happens inside step 2 and is not optional: the console loads a fake
+# self, not an ELF, and an unsigned eboot.bin is a title that fails to start with
+# no message of its own.
+
+set -euo pipefail
+
+root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+cd "$root"
+
+# Opt-in diagnostics do not change allocation routing or normal builds.
+memory_diagnostics=${PS5_MEMORY_DIAGNOSTICS:-0}
+[[ $memory_diagnostics == 0 || $memory_diagnostics == 1 ]] || {
+    echo "PS5_MEMORY_DIAGNOSTICS must be 0 or 1" >&2; exit 2;
+}
+stage=false
+case "${1:-}" in
+    '') ;;
+    --stage) stage=true ;;
+    *) echo "usage: ${0##*/} [--stage]" >&2; exit 2 ;;
+esac
+
+sdk="$root/.deps/native/ps5-payload-sdk"
+# The pinned SDK (my fork; tools/setup-native-dependencies.sh) is installed
+# before anything is compiled against it, and the cores' stamps include its
+# revision.
+bash "$root/tools/setup-native-dependencies.sh" >/dev/null
+[[ -x $sdk/bin/prospero-lld ]] || {
+    echo "error: no SDK at $sdk; run this project's dependency bootstrap first" >&2
+    exit 2
+}
+
+core_names=(fceumm mgba snes9x fbneo genesis_plus_gx ppsspp dolphin pcsx2
+    mednafen_psx_hw mupen64plus_next mednafen_saturn vice_x64sc desmume azahar mame)
+# RPCS3 is not part of the title by default, console builds included: PS3 is no
+# longer a target (2026-10-04), so no deployment puts it on a console.
+# tools/build-rpcs3.sh still builds the core on this machine, and PS5_WITH_RPCS3=1
+# stages it for someone who builds their own title. A release never carries it
+# (GPL-2.0-only beside this port's GPL-3.0 code, docs/RELEASING.md).
+with_rpcs3=0
+if [[ ${PS5_WITH_RPCS3:-0} == 1 ]]; then
+    if [[ -n ${PS5_RELEASE_TAG:-} ]]; then
+        echo "error: PS5_WITH_RPCS3=1 with release $PS5_RELEASE_TAG; a release never carries RPCS3" >&2
+        exit 2
+    fi
+    with_rpcs3=1
+    core_names+=(rpcs3)
+    echo "==> [title] RPCS3 staged (PS5_WITH_RPCS3=1, your own build only)"
+fi
+echo "==> [title] step 1/3: the frontend"
+"$root/tools/build-retroarch.sh"
+core_files=()
+for core_name in "${core_names[@]}"; do
+    # Each library keeps its libretro name; the build script is the port's.
+    case $core_name in
+        pcsx2) script=lrps2 ;;
+        mednafen_psx_hw) script=beetle-psx ;;
+        mednafen_saturn) script=beetle-saturn ;;
+        mupen64plus_next) script=mupen64plus ;;
+        vice_x64sc) script=vice ;;
+        *) script=${core_name//_/-} ;;
+    esac
+    # CI frontend-only build: the cores are the shipped release binaries, staged beforehand.
+    [[ -f "$root/build/cores/stage/cores/${core_name}_libretro.so" ]] || { echo "error: staged core missing: $core_name" >&2; exit 2; }
+    core_files+=("$root/build/cores/stage/cores/${core_name}_libretro.so")
+done
+python3 "$root/tools/core-imports.py" "${core_files[@]}"
+
+# The title's own sources are compiled with the same feature defines as the
+# frontend, because the two share a header full of #ifdefs and a struct whose
+# member order those #ifdefs decide. This is not a nicety; it was a bug with no
+# symptom except a menu that never appeared. Compiled without these, src/'s copy of
+# RetroArch's headers had HAVE_OVERLAY and HAVE_GFX_WIDGETS off, so video_ps5 - the
+# driver table this project hands the frontend - was laid out 8 bytes shorter than
+# the frontend's own view of the same struct. Everything the frontend reads after
+# overlay_interface was therefore the member before it: poke_interface and
+# wrap_type_to_enum both read as NULL. The driver still opened the display and
+# presented 1500 frames, alive() was still the right function by luck, and the only
+# consequence was that RGUI - which renders the menu into its own 320x240
+# framebuffer and hands it over through poke->set_texture_frame - had nowhere to
+# hand it. The frontend calls poke_interface only when it is not NULL, so the
+# hand-over died in silence.
+#
+# The list is not written here: tools/retroarch-flags.sh reads it from the command
+# `make` itself would run, tools/build-retroarch.sh compiles the archive with it,
+# and this passes the same list to the title. Defining a feature the archive does
+# not compile, or omitting one it does, reintroduces exactly this class of fault.
+mapfile -t title_defines < <("$root/tools/retroarch-flags.sh" | tr ' ' '\n' | grep -E '^-D' || true)
+(( ${#title_defines[@]} > 0 )) || { echo "error: no compile flags from tools/retroarch-flags.sh" >&2; exit 2; }
+# tools/build.sh takes the names without the -D and validates each one, so the
+# path-valued flags (quoted string literals) cannot go through it; the paths this
+# title uses are passed to that build separately and point at /app0.
+title_definition_names=()
+for define in "${title_defines[@]}"; do
+    [[ $define == -D*_DIR=* ]] && continue
+    title_definition_names+=("${define#-D}")
+done
+(( ${#title_definition_names[@]} > 0 )) || { echo "error: no feature defines to pass" >&2; exit 2; }
+memory_wrap_flags=""
+if [[ $memory_diagnostics == 1 ]]; then
+    title_definition_names+=(PS5_MEMORY_DIAGNOSTICS)
+    # Mesa's default Vulkan host allocator uses posix_memalign, not malloc.
+    memory_wrap_flags="--wrap=posix_memalign"
+fi
+echo "==> [title] compiling src/ with ${#title_definition_names[@]} frontend defines"
+
+# RetroArch's headers reach their generated config as "../../config.h", a relative
+# path that resolves to <tree>/config.h because the frontend is compiled with the
+# configured tree as the working directory. src/ is compiled from the repository
+# root, so that same include looks for build/config.h. Without the defines it never
+# got that far - the include is inside HAVE_OVERLAY's block. The copy is written
+# from the configured tree's own config.h rather than kept by hand, so the two
+# cannot disagree about what this build is.
+cp -f -- "$root/build/ra-conf/config.h" "$root/build/config.h"
+
+# The Vulkan driver is linked, not loaded. ../PS5_Vulkan measured that a PS5 title
+# cannot dlopen a driver (sceKernelLoadStartModule refuses a linker-produced .so
+# with ENOEXEC, a bare name gives ENOENT, dlopen answers NULL for every candidate
+# and sceKernelDlsym gives ESRCH even for modules the process holds), so RetroArch's
+# dlopen of "libvulkan.so.1" can never succeed here. The route proven on this
+# console is their runner title's: link the driver and call its entry point as an
+# ordinary symbol.
+#
+# The driver is RADV, Mesa's Vulkan driver, from ../PS5_Vulkan's port (its route
+# B, docs/VULKAN_1_4_PLAN.md there): the release archive its tools/build-radv.sh
+# release builds, or the one RADV_ARCHIVE names, linked by that project's
+# tools/radv-link.sh, whose platform bindings this title takes but for the heap:
+# the title's allocator (src/memory_ps5.cpp) stays, as the cores' imports are
+# bound to its routes. src/locale_shims.c steps aside for the platform layer's
+# locale functions. Releases since v0.5.0-alpha.5 ship it.
+#
+# PS5_VULKAN_DRIVER=ps5vk links ps5vk, the project's first driver, which the
+# releases up to v0.4.0-alpha.4 shipped - its released set, exactly as
+# tools/build.sh links it for a driver-enabled title:
+#   libps5vk.ps5.a        the driver            (build/driver/ps5/)
+#   libvk_runtime.ps5.a   Mesa's Vulkan runtime (.deps/native/vulkan-runtime/lib/)
+#   libpsbc_driver.ps5.a  the shader compiler   (build/driver/ps5/)
+#   libpsbc_support.ps5.a the package writer    (.deps/native/psbc/lib/)
+# PS5_VULKAN_DIR overrides the sibling's root, so a release kept elsewhere works.
+vulkan_dir="${PS5_VULKAN_DIR:-$root/../PS5_Vulkan}"
+vulkan_driver=${PS5_VULKAN_DRIVER:-radv}
+case $vulkan_driver in
+    ps5vk | radv) ;;
+    *) echo "PS5_VULKAN_DRIVER must be ps5vk or radv" >&2; exit 2 ;;
+esac
+[[ $vulkan_driver == ps5vk ]] || title_definition_names+=(PS5_RETROARCH_RADV)
+vulkan_archives=(
+    "$vulkan_dir/build/driver/ps5/libps5vk.ps5.a"
+    "$vulkan_dir/.deps/native/vulkan-runtime/lib/libvk_runtime.ps5.a"
+    "$vulkan_dir/build/driver/ps5/libpsbc_driver.ps5.a"
+    "$vulkan_dir/.deps/native/psbc/lib/libpsbc_support.ps5.a"
+)
+vulkan_missing=()
+for archive in "${vulkan_archives[@]}"; do
+    [[ -f $archive ]] || vulkan_missing+=("$archive")
+done
+if (( ${#vulkan_missing[@]} )); then
+    printf 'error: the Vulkan driver archives are missing; the title would link with\n' >&2
+    printf '       vkGetInstanceProcAddr unresolved. Build them in ../PS5_Vulkan\n' >&2
+    printf '       (tools/build-driver.sh) or set PS5_VULKAN_DIR.\n' >&2
+    printf '       missing: %s\n' "${vulkan_missing[@]}" >&2
+    exit 2
+fi
+# The driver may be developed concurrently. A diagnostic link uses stable local
+# archive copies; hashes describe exactly which driver went into this build.
+if [[ $memory_diagnostics == 1 ]]; then
+    if ! snapshot_list=$(python3 - "$root" "${vulkan_archives[@]}" <<'PY_SNAPSHOT'
+import hashlib, json, pathlib, shutil, sys
+out = pathlib.Path(sys.argv[1]) / "build/memory-diagnostic-inputs"
+out.mkdir(parents=True, exist_ok=True)
+records = {}
+for argument in sys.argv[2:]:
+    source = pathlib.Path(argument)
+    before = hashlib.sha256(source.read_bytes()).hexdigest()
+    target = out / source.name
+    shutil.copyfile(source, target)
+    copied = hashlib.sha256(target.read_bytes()).hexdigest()
+    after = hashlib.sha256(source.read_bytes()).hexdigest()
+    if before != copied or before != after:
+        raise SystemExit("Driver archive changed during snapshot; retry when its build finishes")
+    records[source.name] = copied
+    print(target)
+(out / "archives.json").write_text(json.dumps(records, indent=2) + "\n")
+PY_SNAPSHOT
+    ); then
+        echo "error: driver snapshot failed" >&2; exit 2
+    fi
+    mapfile -t vulkan_archives <<< "$snapshot_list"
+fi
+
+# Mesa's weak entry points resolve at link time, and the driver's own symbols must
+# survive the archive boundary (--whole-archive), which is how the sibling links it.
+vulkan_flags="--no-dynamic-linker -z nodynamic-undefined-weak"
+linker_script=""
+if [[ $vulkan_driver == radv ]]; then
+    radv_archive=${RADV_ARCHIVE:-$vulkan_dir/.deps/native/radv-release/lib/libvulkan_radeon.ps5.a}
+    # shellcheck source=/dev/null
+    source "$vulkan_dir/tools/radv-link.sh"
+    radv_link_recipe "$vulkan_dir" "$sdk" "$radv_archive" || exit 2
+    vulkan_archives=("$radv_archive")
+    for flag in "${radv_link_flags[@]}"; do
+        case $flag in
+            --wrap=malloc | --wrap=calloc | --wrap=realloc | --wrap=free | --wrap=posix_memalign | \
+            --wrap=aligned_alloc | --wrap=memalign | --wrap=malloc_usable_size | --wrap=reallocf | \
+            --wrap=reallocarray | --wrap=getline | --wrap=getdelim) ;;
+            *) vulkan_flags+=" $flag" ;;
+        esac
+    done
+    # The C++ runtime, the compiler's builtins and the platform layer.
+    vulkan_flags+=" ${radv_link_inputs[*]:5}"
+    linker_script="$vulkan_dir/tooling/psbc/ps5-pie-unwind.ld"
+fi
+
+# Three Mesa utility sources the archives above reference but do not carry:
+# ../PS5_Vulkan's PS5 object list filters u_thread.c, anon_file.c and os_file.c
+# out, and its own libvulkan.so.1 only links because a shared object may leave
+# symbols undefined. A title may not, so they are compiled here from that
+# project's sources with its PS5 configuration and linked as plain objects.
+# tools/build-mesa-util.sh says which symbols each one is for. It prints the
+# object paths on stdout, so a compile failure has to be caught here: a process
+# substitution would let the link fail later on symbols this step was to supply.
+if [[ $vulkan_driver == radv ]]; then
+    # RADV's archive carries Mesa's utilities whole.
+    vulkan_objects=()
+elif ! vulkan_object_list=$(PS5_VULKAN_DIR="$vulkan_dir" PS5_PAYLOAD_SDK="$sdk" \
+        PS5_CLANG=/usr/bin/clang bash "$root/tools/build-mesa-util.sh"); then
+    echo "error: the driver's Mesa utility objects did not build" >&2
+    exit 2
+else
+    mapfile -t vulkan_objects <<< "$vulkan_object_list"
+fi
+
+# HTTP parser shared with the websrv reference; bounded streaming avoids whole-game buffers.
+webui_http=$(bash "$root/tools/build-webui-http.sh" ps5)
+webui_http=${webui_http#"$root/"}
+webui_update=$(bash "$root/tools/build-webui-update.sh" ps5)
+webui_update=${webui_update#"$root/"}
+
+# Extract once, before the identity is computed, so catalog changes identify the build.
+python3 "$root/tools/generate-core-metadata.py" "$root/build/webui-core-metadata"
+
+# Bind the running trace and FTP readback to these exact source/archive inputs.
+# The console transforms the SELF container, so its whole-file digest differs.
+CORE_NAMES="${core_names[*]}" python3 - "$root" "$memory_diagnostics" "${vulkan_archives[@]}" "${vulkan_objects[@]}" <<'PY'
+import hashlib, os, pathlib, sys
+root = pathlib.Path(sys.argv[1])
+inputs = sorted(p for p in (root / "src").rglob("*") if p.is_file())
+inputs += [root / name for name in (
+    "build/ra/libretroarch.a", "build/ra-conf/config.h", "tools/build-title.sh",
+    "build/core_imports.inc", "tools/build-webui-http.sh", "tools/build-webui-update.sh",
+    "build/webui-update-ps5/libupdate.a",
+    "build/webui-mhd-ps5/src/microhttpd/.libs/libmicrohttpd.a",
+    # The SDK fork's revision: its platform layer is linked into the title, and
+    # a change there alone changes no other input.
+    ".deps/native/ps5-payload-sdk/.ps5-sdk-revision",
+    *(f"build/cores/stage/cores/{name}_libretro.so" for name in os.environ["CORE_NAMES"].split()),
+    "tools/build.sh", "tools/retroarch-flags.sh")]
+inputs += sorted(p for p in (root / "webui").rglob("*") if p.is_file())
+inputs += sorted(p for p in (root / "build/webui-core-metadata").rglob("*") if p.is_file())
+inputs += [pathlib.Path(name) for name in sys.argv[3:]]
+digest = hashlib.sha256()
+digest.update(b"memory-diagnostics=" + sys.argv[2].encode() + b"\0")
+for path in inputs:
+    digest.update(path.name.encode() + b"\0")
+    digest.update(hashlib.sha256(path.read_bytes()).digest())
+identity = digest.hexdigest()
+(root / "build/title_build_identity.h").write_text(
+    '#define PS5_RETROARCH_BUILD_ID "build identity: ' + identity + '"\n')
+print("==> [title] build identity: " + identity)
+PY
+
+# The title's libc++ (std::filesystem) calls libc's opendir, which the console
+# refuses, and openat/fdopendir/unlinkat/fchmodat, which its libkernel does not
+# export; the platform layer implements all of them (libps5platform.a, from my
+# payload SDK fork), and src/platform_wraps.c binds these links to it. A core's
+# own imports of the same calls are bound to it by tools/core-imports.py.
+directory_wrap_flags="--wrap=opendir --wrap=readdir --wrap=closedir --wrap=fdopendir --wrap=openat --wrap=unlinkat --wrap=fchmodat"
+# realpath is refused to a title, so std::filesystem::canonical and
+# weakly_canonical (RPCS3's package installer) came back empty.
+directory_wrap_flags+=" --wrap=realpath"
+# libc's getcwd resolves to nothing in a title (it calls __getcwd, which only
+# libkernel_sys exports); std::filesystem::current_path is built on it.
+directory_wrap_flags+=" --wrap=getcwd"
+# Folders the title or a core creates are 0777 and files at least 0666, so FTP,
+# which runs as another user, can reach them (src/permissions_ps5.cpp).
+directory_wrap_flags+=" --wrap=mkdir --wrap=open --wrap=fopen"
+# No module a title loads exports these: each import was null at run time, and
+# RetroArch's menu search (strcasestr) jumped to address 0 from Manual Scan's
+# Content Directory (src/platform_wraps.c). tools/build.sh refuses the title
+# should one be imported again.
+directory_wrap_flags+=" --wrap=strcasestr --wrap=mkstemp --wrap=link --wrap=symlink --wrap=readlink --wrap=pathconf"
+echo "==> [title] step 2/3: the title"
+# Large frontend/core buffers use mapped memory; wrap all ownership operations.
+PS5_PAYLOAD_SDK="$sdk" \
+PS5_CLANG=/usr/bin/clang \
+PYTHONPATH="$root/tooling/pystub${PYTHONPATH:+:$PYTHONPATH}" \
+APP_DEFINITIONS="${title_definition_names[*]}" \
+APP_INCLUDE_PATHS="build/ra-conf build vendor/retroarch build/ra-conf/libretro-common/include vendor/retroarch/deps vendor/retroarch/deps/stb .deps/webui/libmicrohttpd-1.0.10/src/include .deps/native/zlib/zlib-1.3.2 .deps/native/zlib/zlib-1.3.2/contrib/minizip vendor/retroarch/deps/mbedtls" \
+APP_STATIC_ARCHIVES="build/ra/libretroarch.a $webui_http $webui_update" \
+APP_SDK_ARCHIVES="libps5platform.a" \
+APP_VULKAN_ARCHIVES="${vulkan_archives[*]}" \
+APP_EXTRA_OBJECTS="${vulkan_objects[*]}" \
+APP_LINK_FLAGS="$vulkan_flags --wrap=malloc --wrap=calloc --wrap=realloc --wrap=free $memory_wrap_flags $directory_wrap_flags" \
+APP_LINKER_SCRIPT="$linker_script" \
+    make app
+
+title_id=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["titleId"])' \
+    "$root/sce_sys/param.json")
+dist="$root/dist/$title_id"
+[[ -f $dist/eboot.bin ]] || { echo "error: no eboot.bin under $dist" >&2; exit 2; }
+echo "==> [title] frontend-only build done: $dist/eboot.bin ($(stat -c %s "$dist/eboot.bin") bytes)"
+exit 0

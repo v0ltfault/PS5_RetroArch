@@ -1,0 +1,142 @@
+name: Build title (frontend only, ubuntu-24.04)
+
+# Rebuilds eboot.bin (RetroArch + the platform layer + RADV) on a GitHub-hosted runner
+# with the shipped release's cores staged as-is. Layout on the runner, as the README's
+# sibling layout:
+#   $GITHUB_WORKSPACE/PS5_RetroArch   this checkout
+#   $GITHUB_WORKSPACE/PS5_PayloadSDK  mihawk-99's fork (full history: several pins are used)
+#   $GITHUB_WORKSPACE/PS5_Vulkan      pinned to the release's revision
+#   $GITHUB_WORKSPACE/PS5_Mesa        pinned to the release's revision
+on:
+  workflow_dispatch:
+
+env:
+  VULKAN_REV: f3cbf875f89978deae9f855b9be2610cec2818ae
+  MESA_REV: dc82d010021e4bae5a12cd143ff44db4d7307e47
+  RELEASE_TAG: v0.6.7-alpha.6
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    defaults:
+      run:
+        working-directory: PS5_RetroArch
+    steps:
+      - name: Free disk space
+        working-directory: /
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          df -h /
+
+      - uses: actions/checkout@v4
+        with:
+          path: PS5_RetroArch
+
+      - name: Sibling checkouts
+        working-directory: ${{ github.workspace }}
+        run: |
+          git clone -q https://github.com/mihawk-99/PS5_PayloadSDK.git PS5_PayloadSDK
+          git clone -q https://github.com/mihawk-99/PS5_Vulkan.git PS5_Vulkan
+          git -C PS5_Vulkan -c advice.detachedHead=false checkout -q "$VULKAN_REV"
+          git clone -q https://github.com/mihawk-99/PS5_Mesa.git PS5_Mesa
+          git -C PS5_Mesa -c advice.detachedHead=false checkout -q "$MESA_REV"
+          ls
+
+      - name: Restore caches
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            PS5_Vulkan/.deps
+            PS5_RetroArch/.deps
+            ps5-opengl-sdk-0.3.0
+            ps5-opengl-src
+            downloads
+            pylib
+            ~/.cache/ccache
+          key: ra-fw740-${{ hashFiles('PS5_RetroArch/tools/ci/build-driver-chain.yml') }}-${{ github.run_id }}
+          restore-keys: |
+            ra-fw740-
+
+      - name: Host tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential clang lld llvm llvm-dev libclang-dev clang-format clang-tidy cmake ninja-build nasm make \
+            python3 python3-pip python3-venv python3-ply python3-mako python3-yaml python3-markupsafe \
+            git curl wget unzip tar pkg-config glslang-tools spirv-tools spirv-headers binutils \
+            llvm-spirv-18 libllvmspirvlib-18-dev libclc-18-dev bison flex autoconf automake libtool ccache
+          sudo pip3 install --break-system-packages 'meson>=1.4,<1.9'
+          # Mesa's meson takes the highest llvm-config and then wants LLVMSPIRVLib of that version: leave 18 only.
+          sudo rm -f /usr/bin/llvm-config-19 /usr/bin/llvm-config-17 /usr/bin/llvm-config-16
+          sudo rm -rf /usr/lib/llvm-19/lib/cmake /usr/lib/llvm-17/lib/cmake /usr/lib/llvm-16/lib/cmake
+          sudo ln -sf /usr/bin/llvm-config-18 /usr/local/bin/llvm-config
+          sudo ln -sf /usr/bin/llvm-spirv-18 /usr/local/bin/llvm-spirv
+          clang --version | head -1; meson --version; bash tools/doctor.sh || true
+
+      - name: Driver chain (ps5-opengl SDK, psbc, Vulkan runtime, RADV release)
+        env:
+          PS5_WORKSPACE: ${{ github.workspace }}
+          CCACHE_DIR: /home/runner/.cache/ccache
+        run: bash tools/ci/build-driver-chain.sh
+
+      - name: RetroArch dependencies and sources
+        env:
+          PS5_PAYLOAD_SDK_FORK: ${{ github.workspace }}/PS5_PayloadSDK
+        run: |
+          make deps
+          bash tools/fetch-retroarch.sh
+
+      - name: Stage the release's cores
+        working-directory: ${{ github.workspace }}
+        run: |
+          mkdir -p downloads
+          zip="downloads/PS5_RetroArch-$RELEASE_TAG.zip"
+          [[ -f $zip ]] || curl --fail --location --retry 3 -o "$zip" \
+            "https://github.com/mihawk-99/PS5_RetroArch/releases/download/$RELEASE_TAG/PS5_RetroArch-$RELEASE_TAG.zip"
+          rm -rf release-title && mkdir release-title
+          unzip -q "$zip" -d release-title
+          app=$(find release-title -maxdepth 3 -type d -name PPSA99169 | head -1)
+          [[ -n $app ]] || { echo "no PPSA99169 in the release zip"; find release-title -maxdepth 2 | head; exit 2; }
+          mkdir -p PS5_RetroArch/build/cores/stage/cores PS5_RetroArch/build/cores/stage/info
+          cp "$app"/cores/*_libretro.so PS5_RetroArch/build/cores/stage/cores/
+          cp "$app"/info/*_libretro.info PS5_RetroArch/build/cores/stage/info/
+          ls PS5_RetroArch/build/cores/stage/cores | wc -l
+
+      - name: Title (frontend only)
+        env:
+          PS5_VULKAN_DIR: ${{ github.workspace }}/PS5_Vulkan
+          CCACHE_DIR: /home/runner/.cache/ccache
+        run: bash tools/ci/build-title-frontend.sh
+
+      - name: Result
+        if: always()
+        run: |
+          ls -la dist/PPSA99169 2>/dev/null || true
+          df -h /
+
+      - name: Save caches
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            PS5_Vulkan/.deps
+            PS5_RetroArch/.deps
+            ps5-opengl-sdk-0.3.0
+            ps5-opengl-src
+            downloads
+            pylib
+            ~/.cache/ccache
+          key: ra-fw740-${{ hashFiles('PS5_RetroArch/tools/ci/build-driver-chain.yml') }}-${{ github.run_id }}
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: PPSA99169-frontend
+          path: |
+            PS5_RetroArch/dist/PPSA99169/eboot.bin
+            PS5_RetroArch/dist/PPSA99169/sce_module
+            PS5_RetroArch/dist/PPSA99169/sce_sys
+            PS5_RetroArch/build/eboot.elf
+          retention-days: 14
+          if-no-files-found: ignore
