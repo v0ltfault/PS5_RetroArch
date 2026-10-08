@@ -122,6 +122,17 @@ jobs:
           cp "$app"/info/*_libretro.info PS5_RetroArch/build/cores/stage/info/
           ls PS5_RetroArch/build/cores/stage/cores | wc -l
 
+      - name: Vulkan stub for RetroArch's configure link check
+        # configure insists on linking -lvulkan (vkCreateInstance). RADV is linked statically into the
+        # title by tools/build.sh, so only the check needs a library: a stub in the SDK's homebrew lib dir.
+        run: |
+          sdk=.deps/native/ps5-payload-sdk
+          mkdir -p "$sdk/target/user/homebrew/lib" build/vkstub
+          echo 'int vkCreateInstance(const void* a, const void* b, void** c) { (void)a; (void)b; (void)c; return -1; }' > build/vkstub/vkstub.c
+          echo 'void* vkGetInstanceProcAddr(void* i, const char* n) { (void)i; (void)n; return 0; }' >> build/vkstub/vkstub.c
+          PS5_PAYLOAD_SDK="$PWD/$sdk" "$sdk/bin/prospero-clang" -shared -nostdlib -fPIC -o "$sdk/target/user/homebrew/lib/libvulkan.so" build/vkstub/vkstub.c
+          ls -la "$sdk/target/user/homebrew/lib/"
+
       - name: Title (frontend only)
         env:
           PS5_VULKAN_DIR: ${{ github.workspace }}/PS5_Vulkan
