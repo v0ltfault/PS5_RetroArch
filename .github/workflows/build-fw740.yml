@@ -103,8 +103,7 @@ jobs:
           rm -rf vendor/retroarch vendor/.retroarch-extract && mkdir vendor/.retroarch-extract
           tar xzf "$tb" -C vendor/.retroarch-extract
           mv vendor/.retroarch-extract/retroarch-69a4f0ea1e8a vendor/retroarch && rmdir vendor/.retroarch-extract
-          printf '%s
-' 69a4f0ea1e8aaf442ae4858f2e7f2b31a1776576 > vendor/retroarch/.rarch-revision
+          echo 69a4f0ea1e8aaf442ae4858f2e7f2b31a1776576 > vendor/retroarch/.rarch-revision
           bash tools/fetch-retroarch.sh
 
       - name: Stage the release's cores
