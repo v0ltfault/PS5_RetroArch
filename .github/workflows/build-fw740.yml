@@ -37,10 +37,14 @@ jobs:
         working-directory: ${{ github.workspace }}
         run: |
           git clone -q https://github.com/mihawk-99/PS5_PayloadSDK.git PS5_PayloadSDK
-          git clone -q https://github.com/mihawk-99/PS5_Vulkan.git PS5_Vulkan
-          git -C PS5_Vulkan -c advice.detachedHead=false checkout -q "$VULKAN_REV"
-          git clone -q https://github.com/mihawk-99/PS5_Mesa.git PS5_Mesa
-          git -C PS5_Mesa -c advice.detachedHead=false checkout -q "$MESA_REV"
+          # Pinned commits are fetched by hash (a plain clone could not read the Mesa tree).
+          for pair in PS5_Vulkan:$VULKAN_REV PS5_Mesa:$MESA_REV; do
+            name=${pair%%:*}; rev=${pair#*:}
+            git init -q "$name"
+            git -C "$name" fetch -q --depth 1 "https://github.com/mihawk-99/$name.git" "$rev"
+            git -C "$name" -c advice.detachedHead=false checkout -q FETCH_HEAD
+            git -C "$name" log --oneline -1
+          done
           ls
 
       - name: Restore caches
