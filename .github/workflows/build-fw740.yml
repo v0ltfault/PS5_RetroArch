@@ -125,6 +125,9 @@ jobs:
       - name: Title (frontend only)
         env:
           PS5_VULKAN_DIR: ${{ github.workspace }}/PS5_Vulkan
+          PS5_PAYLOAD_SDK: ${{ github.workspace }}/PS5_RetroArch/.deps/native/ps5-payload-sdk
+          PS5_CLANG: /usr/bin/clang
+          PS5_PAYLOAD_SDK_FORK: ${{ github.workspace }}/PS5_PayloadSDK
           CCACHE_DIR: /home/runner/.cache/ccache
         run: bash tools/ci/build-title-frontend.sh
 
