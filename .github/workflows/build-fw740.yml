@@ -94,6 +94,17 @@ jobs:
           PS5_PAYLOAD_SDK_FORK: ${{ github.workspace }}/PS5_PayloadSDK
         run: |
           make deps
+          # tools/fetch-retroarch.sh at this tag checks for libretro-common/include/retroarch.h, which upstream
+          # 1.22.2 does not have (retroarch.h is at the root): seed vendor/retroarch from the release's own
+          # source tarball instead, with the revision stamp the script expects.
+          mkdir -p ../downloads vendor
+          tb=../downloads/retroarch-69a4f0ea1e8a.tar.gz
+          [[ -f $tb ]] || curl --fail --location --retry 3 -o "$tb" "https://github.com/mihawk-99/PS5_RetroArch/releases/download/$RELEASE_TAG/retroarch-69a4f0ea1e8a.tar.gz"
+          rm -rf vendor/retroarch vendor/.retroarch-extract && mkdir vendor/.retroarch-extract
+          tar xzf "$tb" -C vendor/.retroarch-extract
+          mv vendor/.retroarch-extract/retroarch-69a4f0ea1e8a vendor/retroarch && rmdir vendor/.retroarch-extract
+          printf '%s
+' 69a4f0ea1e8aaf442ae4858f2e7f2b31a1776576 > vendor/retroarch/.rarch-revision
           bash tools/fetch-retroarch.sh
 
       - name: Stage the release's cores
