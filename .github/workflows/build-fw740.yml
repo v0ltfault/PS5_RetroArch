@@ -37,6 +37,11 @@ jobs:
         working-directory: ${{ github.workspace }}
         run: |
           git clone -q https://github.com/mihawk-99/PS5_PayloadSDK.git PS5_PayloadSDK
+          # The pinned SDK revisions are not all reachable from main: fetch them by hash.
+          for rev in 95c08f27386fc698f6bbe21dde3030140a41d10b f05c5dea5110cbcac6ba4e8f090d8e400311770e adc8dd795ada7bf696cd98748aae463a3970ffbb b5efad528e0ac1b8289f39d72a0e890ff68ff0a6; do
+            git -C PS5_PayloadSDK cat-file -e "$rev^{commit}" 2>/dev/null || git -C PS5_PayloadSDK fetch -q origin "$rev" || echo "WARNING: could not fetch $rev"
+          done
+          git -C PS5_PayloadSDK cat-file -e 95c08f27386fc698f6bbe21dde3030140a41d10b^{commit} && echo 'SDK pin 95c08f27 present'
           # Pinned commits are fetched by hash (a plain clone could not read the Mesa tree).
           for pair in PS5_Vulkan:$VULKAN_REV PS5_Mesa:$MESA_REV; do
             name=${pair%%:*}; rev=${pair#*:}

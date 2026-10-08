@@ -54,7 +54,7 @@ fi
 
 cd "$vulkan"
 step "PS5_Vulkan native dependencies (its pinned payload SDK)"
-bash tools/setup-native-dependencies.sh > /dev/null
+bash tools/setup-native-dependencies.sh
 
 if [[ ! -f .deps/native/psbc/PROVENANCE.txt ]]; then
     step "psbc (SPIR-V -> AGC shader compiler)"
