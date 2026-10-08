@@ -135,6 +135,8 @@ jobs:
         if: always()
         run: |
           ls -la dist/PPSA99169 2>/dev/null || true
+          echo '=== configure.log (tail)'; tail -80 build/ra-conf/configure.log 2>/dev/null || true
+          echo '=== config.log (tail)'; tail -40 build/ra-conf/config.log 2>/dev/null || true
           df -h /
 
       - name: Save caches
