@@ -33,7 +33,7 @@
 
 set -euo pipefail
 
-root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd) # tools/ci -> repository root
 cd "$root"
 
 # Opt-in diagnostics do not change allocation routing or normal builds.
